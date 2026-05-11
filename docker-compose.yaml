@@ -1,6 +1,16 @@
 version: "3.8"
 
 services:
+  # Application de démo — génère traces + profils
+  demo-app:
+    build: ./app
+    ports:
+      - "8080:8080"
+    depends_on:
+      - otel-collector
+      - pyroscope
+    restart: unless-stopped
+
   # OpenTelemetry Collector
   otel-collector:
     image: otel/opentelemetry-collector-contrib:latest
@@ -23,28 +33,40 @@ services:
     environment:
       - PYROSCOPE_LOG_LEVEL=info
 
-  # Tempo for distributed tracing
+  # Tempo — stockage des traces distribuées
   tempo:
     image: grafana/tempo:latest
-    command: ["-config.file=/etc/tempo.yaml"]
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./tempo/tempo.yaml:/etc/tempo/tempo.yaml
     ports:
-      - "3200:3200" # Tempo API
+      - "3200:3200" # Tempo API HTTP
       - "9095:9095" # Tempo gRPC
 
-  # Prometheus for metrics
+  # Prometheus — collecte de métriques
   prometheus:
     image: prom/prometheus:latest
     ports:
       - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--web.enable-remote-write-receiver"
 
-  # Grafana for unified visualization
+  # Grafana — visualisation unifiée traces + profils + métriques
   grafana:
     image: grafana/grafana:latest
     ports:
       - "3000:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
       - GF_FEATURE_TOGGLES_ENABLE=flameGraph traceToProfiles
+      - GF_INSTALL_PLUGINS=grafana-pyroscope-app
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
     depends_on:
       - prometheus
       - tempo
