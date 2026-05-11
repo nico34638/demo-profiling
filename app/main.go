@@ -6,10 +6,10 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	_ "net/http/pprof"
 	"runtime"
 	"time"
 
-	pyroscope "github.com/grafana/pyroscope-go"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
@@ -21,32 +21,28 @@ import (
 
 const serviceName = "demo-profiling-app"
 
-func initTracer(ctx context.Context) *sdktrace.TracerProvider {
+func initTracer(ctx context.Context) func() {
 	exp, err := otlptracegrpc.New(ctx,
-		otlptracegrpc.WithEndpoint("otel-collector:4317"),
+		otlptracegrpc.WithEndpoint("otelcol-ebpf-profiler:4317"),
 		otlptracegrpc.WithInsecure(),
 	)
 	if err != nil {
 		log.Fatalf("failed to create trace exporter: %v", err)
 	}
-
-	res := resource.NewWithAttributes(
-		semconv.SchemaURL,
-		semconv.ServiceName(serviceName),
-		semconv.ServiceVersion("1.0.0"),
-		attribute.String("deployment.environment", "demo"),
-	)
-
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exp),
-		sdktrace.WithResource(res),
+		sdktrace.WithResource(resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceName(serviceName),
+			attribute.String("deployment.environment", "demo"),
+		)),
 		sdktrace.WithSampler(sdktrace.AlwaysSample()),
 	)
 	otel.SetTracerProvider(tp)
-	return tp
+	return func() { _ = tp.Shutdown(ctx) }
 }
 
-// cpuIntensiveWork simule un calcul intensif en CPU (math.Sqrt + math.Log forcent le CPU)
+// cpuIntensiveWork force du vrai CPU via math.Sqrt + math.Log (non optimisable par le compilateur)
 func cpuIntensiveWork(iterations int) float64 {
 	result := 0.0
 	for i := 1; i <= iterations; i++ {
@@ -64,144 +60,76 @@ func memoryIntensiveWork(size int) []byte {
 	return buf
 }
 
-// slowHandler simule une requête lente avec beaucoup de CPU
 func slowHandler(w http.ResponseWriter, r *http.Request) {
-	tracer := otel.Tracer(serviceName)
-	ctx, span := tracer.Start(r.Context(), "slow-handler",
-		trace.WithAttributes(attribute.String("http.path", "/slow")),
+	ctx, span := otel.Tracer(serviceName).Start(r.Context(), "slow-handler",
+		trace.WithAttributes(attribute.String("workload", "cpu-heavy")),
 	)
 	defer span.End()
 
-	// Corréler le profil avec le span courant
-	spanCtx := span.SpanContext()
-	pyroscope.TagWrapper(ctx, pyroscope.Labels(
-		"span_id", spanCtx.SpanID().String(),
-		"trace_id", spanCtx.TraceID().String(),
-		"endpoint", "/slow",
-	), func(_ context.Context) {
-		_, childSpan := tracer.Start(ctx, "cpu-computation")
-		cpuIntensiveWork(50_000_000)
-		childSpan.End()
-	})
+	_, child := otel.Tracer(serviceName).Start(ctx, "cpu-computation",
+		trace.WithAttributes(attribute.Int("iterations", 50_000_000)),
+	)
+	result := cpuIntensiveWork(50_000_000)
+	child.SetAttributes(attribute.Float64("result", result))
+	child.End()
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("done\n"))
 }
 
-// fastHandler simule une requête rapide avec peu de CPU
 func fastHandler(w http.ResponseWriter, r *http.Request) {
-	tracer := otel.Tracer(serviceName)
-	ctx, span := tracer.Start(r.Context(), "fast-handler",
-		trace.WithAttributes(attribute.String("http.path", "/fast")),
+	_, span := otel.Tracer(serviceName).Start(r.Context(), "fast-handler",
+		trace.WithAttributes(attribute.String("workload", "cpu-light")),
 	)
 	defer span.End()
 
-	spanCtx := span.SpanContext()
-	pyroscope.TagWrapper(ctx, pyroscope.Labels(
-		"span_id", spanCtx.SpanID().String(),
-		"trace_id", spanCtx.TraceID().String(),
-		"endpoint", "/fast",
-	), func(_ context.Context) {
-		cpuIntensiveWork(100_000)
-	})
-
+	cpuIntensiveWork(100_000)
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("ok\n"))
 }
 
-// leakHandler simule une fuite mémoire progressive
 func leakHandler(w http.ResponseWriter, r *http.Request) {
-	tracer := otel.Tracer(serviceName)
-	ctx, span := tracer.Start(r.Context(), "leak-handler",
-		trace.WithAttributes(attribute.String("http.path", "/leak")),
+	_, span := otel.Tracer(serviceName).Start(r.Context(), "leak-handler",
+		trace.WithAttributes(attribute.String("workload", "memory-alloc")),
 	)
 	defer span.End()
 
-	spanCtx := span.SpanContext()
-	pyroscope.TagWrapper(ctx, pyroscope.Labels(
-		"span_id", spanCtx.SpanID().String(),
-		"trace_id", spanCtx.TraceID().String(),
-		"endpoint", "/leak",
-	), func(_ context.Context) {
-		// Simule des allocations (sera collecté par le profil mémoire)
-		data := memoryIntensiveWork(1024 * 1024) // 1MB
-		runtime.KeepAlive(data)
-	})
-
+	data := memoryIntensiveWork(1024 * 1024)
+	span.SetAttributes(attribute.Int("allocated_bytes", len(data)))
+	runtime.KeepAlive(data)
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("allocated\n"))
 }
 
-// backgroundWork génère du trafic en arrière-plan pour les profils continus
+// backgroundWork génère du trafic continu pour alimenter les profils eBPF
 func backgroundWork(ctx context.Context) {
 	tracer := otel.Tracer(serviceName)
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
+		_, span := tracer.Start(ctx, "background-work")
+		switch rand.Intn(3) {
+		case 0:
+			span.SetAttributes(attribute.String("workload", "cpu-heavy"))
+			cpuIntensiveWork(25_000_000)
+		case 1:
+			span.SetAttributes(attribute.String("workload", "cpu-light"))
+			cpuIntensiveWork(50_000)
+		case 2:
+			span.SetAttributes(attribute.String("workload", "memory-alloc"))
+			data := memoryIntensiveWork(512 * 1024)
+			runtime.KeepAlive(data)
 		}
-
-		endpoint := []string{"/slow", "/fast", "/leak"}[rand.Intn(3)]
-
-		_, span := tracer.Start(ctx, "background-work",
-			trace.WithAttributes(attribute.String("simulated.endpoint", endpoint)),
-		)
-		spanCtx := span.SpanContext()
-
-		pyroscope.TagWrapper(ctx, pyroscope.Labels(
-			"span_id", spanCtx.SpanID().String(),
-			"trace_id", spanCtx.TraceID().String(),
-			"source", "background",
-		), func(_ context.Context) {
-			switch endpoint {
-			case "/slow":
-				cpuIntensiveWork(5_000_000)
-			case "/fast":
-				cpuIntensiveWork(50_000)
-			case "/leak":
-				memoryIntensiveWork(512 * 1024)
-			}
-		})
-
 		span.End()
-		time.Sleep(time.Duration(100+rand.Intn(400)) * time.Millisecond)
+		time.Sleep(time.Duration(200+rand.Intn(300)) * time.Millisecond)
 	}
 }
 
 func main() {
-	// Initialise Pyroscope — envoie les profils directement à Pyroscope
-	_, err := pyroscope.Start(pyroscope.Config{
-		ApplicationName: serviceName,
-		ServerAddress:   "http://pyroscope:4040",
-		Logger:          pyroscope.StandardLogger,
-		Tags:            map[string]string{"environment": "demo"},
-		ProfileTypes: []pyroscope.ProfileType{
-			pyroscope.ProfileCPU,
-			pyroscope.ProfileAllocObjects,
-			pyroscope.ProfileAllocSpace,
-			pyroscope.ProfileInuseObjects,
-			pyroscope.ProfileInuseSpace,
-			pyroscope.ProfileGoroutines,
-		},
-	})
-	if err != nil {
-		log.Fatalf("failed to start pyroscope: %v", err)
-	}
-
-	// Initialise OTel Tracing (envoie les traces vers le collector)
 	ctx := context.Background()
-	tp := initTracer(ctx)
-	defer func() {
-		if err := tp.Shutdown(ctx); err != nil {
-			log.Printf("failed to shutdown tracer: %v", err)
-		}
-	}()
+	shutdown := initTracer(ctx)
+	defer shutdown()
 
-	// Lance le générateur de trafic en arrière-plan
 	go backgroundWork(ctx)
 
-	// Expose les endpoints HTTP
 	http.HandleFunc("/slow", slowHandler)
 	http.HandleFunc("/fast", fastHandler)
 	http.HandleFunc("/leak", leakHandler)
@@ -211,7 +139,7 @@ func main() {
 	})
 
 	log.Printf("Service '%s' démarré sur :8080", serviceName)
-	log.Println("  GET /slow  — charge CPU élevée")
+	log.Println("  GET /slow  — charge CPU élevée (~1-3s)")
 	log.Println("  GET /fast  — charge CPU faible")
 	log.Println("  GET /leak  — allocations mémoire")
 	log.Fatal(http.ListenAndServe(":8080", nil))

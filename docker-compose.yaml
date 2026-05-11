@@ -1,37 +1,62 @@
-version: "3.8"
-
 services:
-  # Application de démo — génère traces + profils
   demo-app:
     build: ./app
     ports:
       - "8080:8080"
-    depends_on:
-      - otel-collector
-      - pyroscope
     restart: unless-stopped
 
-  # OpenTelemetry Collector
+  # Monte debugfs et tracefs dans la VM Docker Desktop (requis par eBPF)
+  mount-kernel-fs:
+    image: alpine:latest
+    privileged: true
+    pid: host
+    command: >
+      sh -c "
+        nsenter --mount=/proc/1/ns/mnt -- sh -c '
+          mountpoint -q /sys/kernel/debug  || mount -t debugfs  debugfs  /sys/kernel/debug;
+          mountpoint -q /sys/kernel/tracing || mount -t tracefs tracefs /sys/kernel/tracing;
+          echo done
+        '
+      "
+    restart: "no"
+
+  # OTel Collector — reçoit les traces de l'app et les route vers Tempo
   otel-collector:
     image: otel/opentelemetry-collector-contrib:latest
     command: ["--config=/etc/otel-collector-config.yaml"]
     volumes:
       - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml
     ports:
-      - "4317:4317" # OTLP gRPC
-      - "4318:4318" # OTLP HTTP
-      - "13133:13133" # Health check
+      - "4317:4317"
+      - "4318:4318"
     depends_on:
       - tempo
-      - pyroscope
 
-  # Pyroscope for profile storage and visualization
+  # OTel eBPF Profiler — profile tous les processus de la VM via eBPF
+  otelcol-ebpf-profiler:
+    image: otel/opentelemetry-collector-ebpf-profiler:latest
+    pid: host
+    privileged: true
+    command:
+      - --feature-gates=+service.profilesSupport
+      - --config=/etc/otelcol-ebpf-profiler.yaml
+    volumes:
+      - ./otelcol-ebpf-profiler.yaml:/etc/otelcol-ebpf-profiler.yaml
+      - /sys/kernel/debug:/sys/kernel/debug:ro
+      - /sys/kernel/tracing:/sys/kernel/tracing:ro
+      - /proc:/proc:ro
+    depends_on:
+      mount-kernel-fs:
+        condition: service_completed_successfully
+      pyroscope:
+        condition: service_started
+      tempo:
+        condition: service_started
+
   pyroscope:
     image: grafana/pyroscope:latest
     ports:
       - "4040:4040"
-    environment:
-      - PYROSCOPE_LOG_LEVEL=info
 
   # Tempo — stockage des traces distribuées
   tempo:
@@ -40,17 +65,7 @@ services:
     volumes:
       - ./tempo/tempo.yaml:/etc/tempo/tempo.yaml
     ports:
-      - "3200:3200" # Tempo API HTTP
-      - "9095:9095" # Tempo gRPC
-
-  # Prometheus — collecte de métriques
-  prometheus:
-    image: prom/prometheus:latest
-    ports:
-      - "9090:9090"
-    command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--web.enable-remote-write-receiver"
+      - "3200:3200"
 
   # Grafana — visualisation unifiée traces + profils + métriques
   grafana:
@@ -58,8 +73,6 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_SECURITY_ADMIN_USER=admin
       - GF_AUTH_ANONYMOUS_ENABLED=true
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
       - GF_AUTH_DISABLE_LOGIN_FORM=true
@@ -68,12 +81,10 @@ services:
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning
     depends_on:
-      - prometheus
       - tempo
       - pyroscope
 
 volumes:
   pyroscope-data:
   tempo-data:
-  prometheus-data:
   grafana-data:
