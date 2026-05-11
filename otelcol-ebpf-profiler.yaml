@@ -1,27 +1,32 @@
 # Configuration pour otelcol-ebpf-profiler
-# Cette distribution OTel Collector embarque le receiver eBPF.
-# Le receiver "profiling" collecte les profils CPU de tous les processus du host via eBPF
-# et les exporte directement vers Pyroscope via OTLP HTTP.
-#
-# Prérequis :
-#   - pid: host (accès aux PID du host)
-#   - privileged: true (accès eBPF / /proc / /sys)
-#   - --feature-gates=+service.profilesSupport
+# --feature-gates=+service.profilesSupport,+otelcol.resourcedetection.processcontext
+# Le feature gate processcontext permet de lire OTEL_SERVICE_NAME depuis /proc/<pid>/environ
 
 receivers:
   profiling:
+    include_env_vars: "OTEL_SERVICE_NAME"
+
+processors:
+  transform/add_service_name:
+    error_mode: ignore
+    profile_statements:
+      - context: resource
+        statements:
+          - set(attributes["service.name"], attributes["process.environment_variable.OTEL_SERVICE_NAME"])
+            where attributes["process.environment_variable.OTEL_SERVICE_NAME"] != nil
 
 exporters:
-  otlphttp/pyroscope:
+  otlp_http/pyroscope:
     endpoint: "http://pyroscope:4040"
     tls:
       insecure: true
 
   debug:
-    verbosity: basic
+    verbosity: detailed
 
 service:
   pipelines:
     profiles:
       receivers: [profiling]
-      exporters: [otlphttp/pyroscope, debug]
+      processors: [transform/add_service_name]
+      exporters: [otlp_http/pyroscope]

@@ -3,6 +3,18 @@ services:
     build: ./app
     ports:
       - "8080:8080"
+    environment:
+      - OTEL_SERVICE_NAME=demo-profiling-app
+      - OTEL_RESOURCE_ATTRIBUTES=service.name=demo-profiling-app
+    restart: unless-stopped
+
+  demo-app-node:
+    build: ./app-node
+    ports:
+      - "8081:8081"
+    environment:
+      - OTEL_SERVICE_NAME=demo-profiling-app-node
+      - OTEL_RESOURCE_ATTRIBUTES=service.name=demo-profiling-app-node
     restart: unless-stopped
 
   # Monte debugfs et tracefs dans la VM Docker Desktop (requis par eBPF)
