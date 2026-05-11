@@ -1,0 +1,57 @@
+version: "3.8"
+
+services:
+  # OpenTelemetry Collector
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    ports:
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP
+      - "13133:13133" # Health check
+    depends_on:
+      - tempo
+      - pyroscope
+
+  # Pyroscope for profile storage and visualization
+  pyroscope:
+    image: grafana/pyroscope:latest
+    ports:
+      - "4040:4040"
+    environment:
+      - PYROSCOPE_LOG_LEVEL=info
+
+  # Tempo for distributed tracing
+  tempo:
+    image: grafana/tempo:latest
+    command: ["-config.file=/etc/tempo.yaml"]
+    ports:
+      - "3200:3200" # Tempo API
+      - "9095:9095" # Tempo gRPC
+
+  # Prometheus for metrics
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+
+  # Grafana for unified visualization
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_FEATURE_TOGGLES_ENABLE=flameGraph traceToProfiles
+    depends_on:
+      - prometheus
+      - tempo
+      - pyroscope
+
+volumes:
+  pyroscope-data:
+  tempo-data:
+  prometheus-data:
+  grafana-data:
