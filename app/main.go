@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"math"
 	"math/rand"
 	"net/http"
 	"runtime"
@@ -45,11 +46,11 @@ func initTracer(ctx context.Context) *sdktrace.TracerProvider {
 	return tp
 }
 
-// cpuIntensiveWork simule un calcul intensif en CPU
+// cpuIntensiveWork simule un calcul intensif en CPU (math.Sqrt + math.Log forcent le CPU)
 func cpuIntensiveWork(iterations int) float64 {
 	result := 0.0
-	for i := 0; i < iterations; i++ {
-		result += float64(i) * float64(i)
+	for i := 1; i <= iterations; i++ {
+		result += math.Sqrt(float64(i)) * math.Log(float64(i))
 	}
 	return result
 }
@@ -79,7 +80,7 @@ func slowHandler(w http.ResponseWriter, r *http.Request) {
 		"endpoint", "/slow",
 	), func(_ context.Context) {
 		_, childSpan := tracer.Start(ctx, "cpu-computation")
-		cpuIntensiveWork(10_000_000)
+		cpuIntensiveWork(50_000_000)
 		childSpan.End()
 	})
 
