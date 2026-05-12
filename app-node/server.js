@@ -21,7 +21,7 @@ sdk.start();
 
 process.on("SIGTERM", () => sdk.shutdown().finally(() => process.exit(0)));
 
-const http = require("http");
+const express = require("express");
 const { trace, context } = require("@opentelemetry/api");
 
 const tracer = trace.getTracer("demo-profiling-app-node");
@@ -71,50 +71,71 @@ function backgroundWork() {
   loop();
 }
 
-const server = http.createServer((req, res) => {
-  const span = tracer.startSpan(`${req.method} ${req.url}`);
-  const ctx = trace.setSpan(context.active(), span);
+async function handleSlow(req, res) {
+  const span = tracer.startSpan("slow-handler", {}, context.active());
+  span.setAttribute("workload", "cpu-heavy");
+  const result = cpuIntensiveWork(50_000_000);
+  span.setAttribute("result", result);
+  span.end();
+  res.send("done\n");
+}
 
-  context.with(ctx, () => {
-    if (req.url === "/slow") {
-      const child = tracer.startSpan("cpu-computation", {}, ctx);
-      child.setAttribute("iterations", 15_000_000);
-      const result = cpuIntensiveWork(15_000_000);
-      child.setAttribute("result", result);
-      child.end();
-      span.end();
-      res.writeHead(200);
-      res.end("done\n");
-    } else if (req.url === "/fast") {
-      cpuIntensiveWork(50_000);
-      span.end();
-      res.writeHead(200);
-      res.end("ok\n");
-    } else if (req.url === "/leak") {
-      const data = memoryIntensiveWork(1024 * 1024);
-      span.setAttribute("allocated_bytes", data.length);
-      span.end();
-      res.writeHead(200);
-      res.end("allocated\n");
-    } else if (req.url === "/healthz") {
-      span.end();
-      res.writeHead(200);
-      res.end("ok\n");
-    } else {
-      span.end();
-      res.writeHead(404);
-      res.end("not found\n");
-    }
+async function handleFast(req, res) {
+  const span = tracer.startSpan("fast-handler", {}, context.active());
+  span.setAttribute("workload", "cpu-light");
+  const result = cpuIntensiveWork(100_000);
+  span.setAttribute("result", result);
+  span.end();
+  res.send("ok\n");
+}
+
+async function handleLeak(req, res) {
+  const span = tracer.startSpan("leak-handler", {}, context.active());
+  span.setAttribute("workload", "memory-alloc");
+  const data = memoryIntensiveWork(1024 * 1024);
+  span.setAttribute("allocated_bytes", data.length);
+  span.end();
+  res.send("allocated\n");
+}
+
+function handleHealthz(req, res) {
+  res.send("ok\n");
+}
+
+// Routes async
+
+// --- App Express ---
+
+const app = express();
+
+// Middleware : span parent pour chaque requête
+app.use((req, res, next) => {
+  const span = tracer.startSpan(`${req.method} ${req.path}`);
+  const ctx = trace.setSpan(context.active(), span);
+  res.on("finish", () => {
+    span.setAttribute("http.status_code", res.statusCode);
+    span.end();
   });
+  context.with(ctx, next);
 });
 
-server.listen(8081, () => {
-  console.log(
-    `Service '${process.env.OTEL_SERVICE_NAME || "demo-profiling-app-node"}' démarré sur :8081`,
-  );
-  console.log("  GET /slow  — charge CPU élevée");
-  console.log("  GET /fast  — charge CPU faible");
-  console.log("  GET /leak  — allocations mémoire");
+app.get("/slow", handleSlow);
+app.get("/fast", handleFast);
+app.get("/leak", handleLeak);
+app.get("/healthz", handleHealthz);
+
+// Gestion des erreurs async
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).send("internal error\n");
+});
+
+app.listen(8081, () => {
+  const name = process.env.OTEL_SERVICE_NAME || "demo-profiling-app-node";
+  console.log(`Service '${name}' démarré sur :8081`);
+  console.log("  GET /slow        — charge CPU élevée (~1-3s)");
+  console.log("  GET /fast        — charge CPU faible");
+  console.log("  GET /leak        — allocations mémoire");
 });
 
 backgroundWork();
