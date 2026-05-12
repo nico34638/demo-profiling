@@ -13,7 +13,7 @@ const sdk = new NodeSDK({
       process.env.OTEL_SERVICE_NAME || "demo-profiling-app-node",
   }),
   traceExporter: new OTLPTraceExporter({
-    url: "grpc://otel-collector:4317",
+    url: "http://otel-collector:4317",
   }),
 });
 
